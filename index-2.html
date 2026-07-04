@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ALiCut</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { margin: 0; background: #0D0F12; }
+  input[type="range"] {
+    -webkit-appearance: none;
+    height: 4px;
+    border-radius: 2px;
+    background: #2A2E35;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #FF7A45; cursor: pointer; border: 2px solid #0D0F12;
+  }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useRef, useEffect, useCallback } = React;
+
+const FILTERS = {
+  none: { label: "Без фильтра", css: "none" },
+  bw: { label: "Ч/Б", css: "grayscale(1)" },
+  bright: { label: "Яркость", css: "brightness(1.3) saturate(1.2)" },
+  vintage: { label: "Винтаж", css: "sepia(0.4) contrast(1.1) saturate(0.8)" },
+  cold: { label: "Холодный", css: "hue-rotate(180deg) saturate(1.3)" },
+};
+
+const SPEEDS = [0.5, 1, 1.5, 2];
+
+function formatTime(s) {
+  if (!isFinite(s)) return "0:00";
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, "0")}`;
+}
+
+function App() {
+  const [videoUrl, setVideoUrl] = useState(null);
+  const [duration, setDuration] = useState(0);
+  const [trimStart, setTrimStart] = useState(0);
+  const [trimEnd, setTrimEnd] = useState(0);
+  const [speed, setSpeed] = useState(1);
+  const [filterKey, setFilterKey] = useState("none");
+  const [text, setText] = useState("");
+  const [textColor, setTextColor] = useState("#FFFFFF");
+  const [textSize, setTextSize] = useState(32);
+  const [textPos, setTextPos] = useState("bottom");
+  const [isExporting, setIsExporting] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [outputUrl, setOutputUrl] = useState(null);
+  const [error, setError] = useState("");
+
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const recordedChunks = useRef([]);
+  const mediaRecorderRef = useRef(null);
+  const rafRef = useRef(null);
+  const audioCtxRef = useRef(null);
+
+  const handleFile = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setError("");
+    setOutputUrl(null);
+    const url = URL.createObjectURL(file);
+    setVideoUrl(url);
+  };
+
+  const onLoadedMetadata = () => {
+    const d = videoRef.current.duration;
+    setDuration(d);
+    setTrimStart(0);
+    setTrimEnd(d);
+  };
+
+  const textPosStyle = () => {
+    if (textPos === "top") return { top: "8%" };
+    if (textPos === "center") return { top: "50%", transform: "translateY(-50%)" };
+    return { bottom: "8%" };
+  };
+
+  const drawTextOnCanvas = (ctx, canvas) => {
+    if (!text) return;
+    ctx.save();
+    ctx.font = `bold ${textSize * (canvas.width / 480)}px sans-serif`;
+    ctx.fillStyle = textColor;
+    ctx.textAlign = "center";
+    ctx.strokeStyle = "rgba(0,0,0,0.6)";
+    ctx.lineWidth = 4;
+    let y;
+    if (textPos === "top") y = canvas.height * 0.12;
+    else if (textPos === "center") y = canvas.height * 0.5;
+    else y = canvas.height * 0.88;
+    ctx.strokeText(text, canvas.width / 2, y);
+    ctx.fillText(text, canvas.width / 2, y);
+    ctx.restore();
+  };
+
+  const stopEverything = () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+  };
+
+  const handleExport = async () => {
+    setError("");
+    setOutputUrl(null);
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || trimEnd <= trimStart) {
+      setError("Проверь диапазон обрезки — конец должен быть позже начала.");
+      return;
+    }
+
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 360;
+    const ctx = canvas.getContext("2d");
+
+    let mimeType = "video/webm;codecs=vp9,opus";
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+      mimeType = "video/webm;codecs=vp8,opus";
+    }
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+      mimeType = "video/webm";
+    }
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+      setError("Этот браузер не поддерживает запись видео. Попробуй Chrome.");
+      return;
+    }
+
+    let combinedStream;
+    try {
+      const canvasStream = canvas.captureStream(30);
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      audioCtxRef.current = audioCtx;
+      const source = audioCtx.createMediaElementSource(video);
+      const dest = audioCtx.createMediaStreamDestination();
+      source.connect(dest);
+      source.connect(audioCtx.destination);
+      combinedStream = new MediaStream([
+        ...canvasStream.getVideoTracks(),
+        ...dest.stream.getAudioTracks(),
+      ]);
+    } catch (err) {
+      setError("Не удалось подготовить запись: " + err.message);
+      return;
+    }
+
+    recordedChunks.current = [];
+    const recorder = new MediaRecorder(combinedStream, { mimeType });
+    mediaRecorderRef.current = recorder;
+
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) recordedChunks.current.push(e.data);
+    };
+
+    recorder.onstop = () => {
+      const blob = new Blob(recordedChunks.current, { type: "video/webm" });
+      const url = URL.createObjectURL(blob);
+      setOutputUrl(url);
+      setIsExporting(false);
+      setProgress(0);
+      stopEverything();
+    };
+
+    video.currentTime = trimStart;
+    video.playbackRate = speed;
+
+    const drawFrame = () => {
+      if (video.paused || video.ended) return;
+      ctx.filter = FILTERS[filterKey].css;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      ctx.filter = "none";
+      drawTextOnCanvas(ctx, canvas);
+
+      const pct = Math.min(
+        100,
+        ((video.currentTime - trimStart) / (trimEnd - trimStart)) * 100
+      );
+      setProgress(pct);
+
+      if (video.currentTime >= trimEnd) {
+        video.pause();
+        recorder.stop();
+        return;
+      }
+      rafRef.current = requestAnimationFrame(drawFrame);
+    };
+
+    video.onseeked = () => {
+      setIsExporting(true);
+      recorder.start();
+      video.play();
+      rafRef.current = requestAnimationFrame(drawFrame);
+      video.onseeked = null;
+    };
+  };
+
+  useEffect(() => stopEverything, []);
+
+  return (
+    <div className="min-h-screen bg-[#0D0F12] text-[#E7E9EC] flex flex-col">
+      <header className="px-5 sm:px-8 pt-8 pb-5 flex items-center justify-between border-b border-[#1E2229]">
+        <div className="flex items-center gap-2">
+          <span className="text-2xl">🎬</span>
+          <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">ALiCut</h1>
+        </div>
+        {videoUrl && (
+          <button
+            onClick={handleExport}
+            disabled={isExporting}
+            className="px-4 py-2 rounded bg-[#7CFF6B] text-[#0D0F12] font-semibold text-sm disabled:opacity-40"
+          >
+            {isExporting ? `Рендер ${Math.round(progress)}%` : "Экспорт"}
+          </button>
+        )}
+      </header>
+
+      <main className="flex-1 px-5 sm:px-8 py-6 max-w-2xl mx-auto w-full">
+        {!videoUrl ? (
+          <label className="flex flex-col items-center justify-center border-2 border-dashed border-[#2A2E35] rounded-lg py-20 cursor-pointer hover:border-[#7CFF6B] transition-colors">
+            <span className="text-4xl mb-3">📼</span>
+            <span className="text-[#8A9099] mb-1">Выбери видео с телефона</span>
+            <span className="text-xs text-[#5A5F68]">MP4, WebM и другие</span>
+            <input type="file" accept="video/*" className="hidden" onChange={handleFile} />
+          </label>
+        ) : (
+          <div className="space-y-6">
+            <div className="relative bg-black rounded-lg overflow-hidden">
+              <video
+                ref={videoRef}
+                src={videoUrl}
+                onLoadedMetadata={onLoadedMetadata}
+                controls
+                playsInline
+                className="w-full max-h-[50vh]"
+                style={{ filter: FILTERS[filterKey].css }}
+              />
+              {text && (
+                <div
+                  className="absolute left-0 right-0 px-4 text-center font-bold pointer-events-none"
+                  style={{
+                    ...textPosStyle(),
+                    color: textColor,
+                    fontSize: `${textSize / 2}px`,
+                    textShadow: "0 0 6px rgba(0,0,0,0.8)",
+                  }}
+                >
+                  {text}
+                </div>
+              )}
+            </div>
+
+            <canvas ref={canvasRef} className="hidden" />
+
+            {error && (
+              <div className="px-4 py-2 rounded bg-[#3A2126] text-[#E39B8D] text-sm">
+                {error}
+              </div>
+            )}
+
+            {outputUrl && (
+              <a
+                href={outputUrl}
+                download="alicut-export.webm"
+                className="block text-center px-4 py-3 rounded bg-[#7CFF6B] text-[#0D0F12] font-semibold"
+              >
+                ⬇ Скачать готовое видео
+              </a>
+            )}
+
+            <section>
+              <h2 className="text-xs uppercase tracking-wide text-[#8A9099] mb-2">
+                Обрезка ({formatTime(trimStart)} — {formatTime(trimEnd)})
+              </h2>
+              <div className="space-y-2">
+                <div>
+                  <span className="text-xs text-[#5A5F68] mono">Начало</span>
+                  <input
+                    type="range"
+                    min="0"
+                    max={duration}
+                    step="0.1"
+                    value={trimStart}
+                    onChange={(e) => setTrimStart(Math.min(parseFloat(e.target.value), trimEnd - 0.5))}
+                    className="w-full"
+                  />
+                </div>
+                <div>
+                  <span className="text-xs text-[#5A5F68] mono">Конец</span>
+                  <input
+                    type="range"
+                    min="0"
+                    max={duration}
+                    step="0.1"
+                    value={trimEnd}
+                    onChange={(e) => setTrimEnd(Math.max(parseFloat(e.target.value), trimStart + 0.5))}
+                    className="w-full"
+                  />
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <h2 className="text-xs uppercase tracking-wide text-[#8A9099] mb-2">Скорость</h2>
+              <div className="flex gap-2">
+                {SPEEDS.map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setSpeed(s)}
+                    className={`px-3 py-1.5 rounded text-sm ${
+                      speed === s ? "bg-[#FF7A45] text-[#0D0F12] font-semibold" : "bg-[#16191E] text-[#8A9099]"
+                    }`}
+                  >
+                    {s}x
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            <section>
+              <h2 className="text-xs uppercase tracking-wide text-[#8A9099] mb-2">Фильтр</h2>
+              <div className="flex flex-wrap gap-2">
+                {Object.entries(FILTERS).map(([key, f]) => (
+                  <button
+                    key={key}
+                    onClick={() => setFilterKey(key)}
+                    className={`px-3 py-1.5 rounded text-sm ${
+                      filterKey === key ? "bg-[#7CFF6B] text-[#0D0F12] font-semibold" : "bg-[#16191E] text-[#8A9099]"
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            <section>
+              <h2 className="text-xs uppercase tracking-wide text-[#8A9099] mb-2">Текст поверх видео</h2>
+              <input
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                placeholder="Введи текст..."
+                className="w-full mb-3 px-3 py-2 rounded bg-[#16191E] border border-[#2A2E35] focus:outline-none focus:border-[#7CFF6B]"
+              />
+              <div className="flex items-center gap-4 flex-wrap">
+                <label className="flex items-center gap-2 text-sm text-[#8A9099]">
+                  Цвет
+                  <input
+                    type="color"
+                    value={textColor}
+                    onChange={(e) => setTextColor(e.target.value)}
+                    className="w-8 h-8 rounded border-none bg-transparent"
+                  />
+                </label>
+                <label className="flex items-center gap-2 text-sm text-[#8A9099]">
+                  Размер
+                  <input
+                    type="range"
+                    min="16"
+                    max="64"
+                    value={textSize}
+                    onChange={(e) => setTextSize(parseInt(e.target.value))}
+                    className="w-24"
+                  />
+                </label>
+                <div className="flex gap-1">
+                  {[["top", "Верх"], ["center", "Центр"], ["bottom", "Низ"]].map(([k, label]) => (
+                    <button
+                      key={k}
+                      onClick={() => setTextPos(k)}
+                      className={`px-2 py-1 rounded text-xs ${
+                        textPos === k ? "bg-[#FF7A45] text-[#0D0F12]" : "bg-[#16191E] text-[#8A9099]"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </section>
+
+            <button
+              onClick={() => {
+                setVideoUrl(null);
+                setOutputUrl(null);
+                setText("");
+              }}
+              className="text-sm text-[#5A5F68] underline"
+            >
+              Выбрать другое видео
+            </button>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
